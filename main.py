@@ -6,7 +6,7 @@ import locale
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, callback_query, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -14,7 +14,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 import aiosqlite
 
-# Импорт готовой библиотеки календаря
 from aiogram3_calendar import SimpleCalendar
 from aiogram3_calendar.simple_calendar import SimpleCalendarCallback
 
@@ -25,7 +24,7 @@ except locale.Error:
     try:
         locale.setlocale(locale.LC_TIME, 'Russian_Russia.1251')
     except locale.Error:
-        logging.warning("Не удалось установить русскую локаль в системе. Используются дефолтные настройки.")
+        logging.warning("Не удалось установить русскую локаль. Используются дефолтные настройки.")
 
 # Загрузка конфигурации
 load_dotenv()
@@ -65,15 +64,18 @@ async def init_db():
                 name TEXT NOT NULL
             )
         """)
+        # Добавлено поле photo_id
         await db.execute("""
             CREATE TABLE IF NOT EXISTS services (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 category_id INTEGER,
                 name TEXT NOT NULL,
                 price INTEGER,
+                photo_id TEXT,
                 FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE CASCADE
             )
         """)
+        # Добавлено поле admin_comment
         await db.execute("""
             CREATE TABLE IF NOT EXISTS appointments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,10 +87,23 @@ async def init_db():
                 allergies_comment TEXT,
                 status TEXT DEFAULT 'pending',
                 reminded INTEGER DEFAULT 0,
+                admin_comment TEXT,
                 FOREIGN KEY (service_id) REFERENCES services(id) ON DELETE CASCADE
             )
         """)
         await db.commit()
+        
+    # Мягкая миграция: добавляем новые колонки в уже существующую БД, если их там нет
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("ALTER TABLE services ADD COLUMN photo_id TEXT;")
+            await db.commit()
+    except Exception: pass
+    try:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("ALTER TABLE appointments ADD COLUMN admin_comment TEXT;")
+            await db.commit()
+    except Exception: pass
 
 # ==========================================
 # МАШИНЫ СОСТОЯНИЙ (FSM)
@@ -108,9 +123,37 @@ class AdminPrice(StatesGroup):
     service_category = State()
     service_name = State()
     service_price = State()
+    service_photo = State() # Новое состояние для фото услуги
+
+class AdminSchedule(StatesGroup):
+    select_date = State()
+    add_comment = State() # Новое состояние для заметки
 
 class AdminBroadcast(StatesGroup):
     message = State()
+
+# ==========================================
+# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ КАЛЕНДАРЯ
+# ==========================================
+
+async def highlight_calendar(markup, year: int, month: int):
+    """Добавляет маркер 🟢 к дням, на которые есть подтвержденные записи"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute(
+            "SELECT DISTINCT date FROM appointments WHERE date LIKE ? AND status = 'confirmed'",
+            (f"{year}-{month:02d}-%",)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            
+    booked_days = {int(row[0].split('-')[2]) for row in rows}
+    
+    for row in markup.inline_keyboard:
+        for btn in row:
+            if btn.text.isdigit(): 
+                day = int(btn.text)
+                if day in booked_days:
+                    btn.text = f"{day}🟢" 
+    return markup
 
 # ==========================================
 # КЛАВИАТУРЫ
@@ -125,7 +168,7 @@ def get_main_menu() -> ReplyKeyboardMarkup:
 def get_admin_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="📥 Новые заявки", callback_data="adm_pending"))
-    builder.row(InlineKeyboardButton(text="📅 Сегодня", callback_data="adm_sched_today"), InlineKeyboardButton(text="│ Завтра", callback_data="adm_sched_tomorrow"))
+    builder.row(InlineKeyboardButton(text="📅 Выбрать дату расписания", callback_data="adm_sched_calendar"))
     builder.row(InlineKeyboardButton(text="➕ Категорию", callback_data="adm_add_cat"), InlineKeyboardButton(text="➕ Услугу", callback_data="adm_add_serv"))
     builder.row(InlineKeyboardButton(text="❌ Удалить услугу", callback_data="adm_del_serv_list"))
     builder.row(InlineKeyboardButton(text="📢 Рассылка", callback_data="adm_broadcast"))
@@ -162,35 +205,50 @@ async def cmd_contacts(message: Message):
         parse_mode="HTML"
     )
 
+# Интерактивный прайс-лист
 @router.message(F.text == "📋 Прайс-лист")
 async def cmd_price(message: Message):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT id, name FROM categories") as cursor:
             categories = await cursor.fetchall()
+            
+    if not categories:
+        await message.answer("Прайс-лист пока не заполнен.")
+        return
         
-        if not categories:
-            await message.answer("Прайс-лист пока не заполнен.")
-            return
-            
-        text = "📋 <b>Наш Прайс-лист:</b>\n\n"
-        for cat_id, cat_name in categories:
-            text += f"▪️ <b>{cat_name}</b>\n"
-            async with db.execute("SELECT name, price FROM services WHERE category_id = ?", (cat_id,)) as s_cursor:
-                services = await s_cursor.fetchall()
-            if services:
-                for s_name, s_price in services:
-                    text += f"   ── {s_name}: {s_price} руб.\n"
-            else:
-                text += "   <i>Услуг пока нет</i>\n"
-            text += "\n"
-            
-    await message.answer(text, parse_mode="HTML")
+    builder = InlineKeyboardBuilder()
+    for cat_id, cat_name in categories:
+        builder.row(InlineKeyboardButton(text=cat_name, callback_data=f"view_cat_{cat_id}"))
+        
+    await message.answer("📋 <b>Выберите категорию для просмотра услуг:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
 
+@router.callback_query(F.data.startswith("view_cat_"))
+async def view_category_services(callback: CallbackQuery):
+    cat_id = int(callback.data.split("_")[2])
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT name, price, photo_id FROM services WHERE category_id = ?", (cat_id,)) as cursor:
+            services = await cursor.fetchall()
+            
+    if not services:
+        await callback.answer("В этой категории услуг пока нет.", show_alert=True)
+        return
+        
+    await callback.message.answer("✨ <b>Список услуг категории:</b>", parse_mode="HTML")
+    for name, price, photo_id in services:
+        caption = f"💆‍♀️ <b>{name}</b>\n💰 Цена: {price} руб."
+        if photo_id:
+            await callback.message.answer_photo(photo=photo_id, caption=caption, parse_mode="HTML")
+        else:
+            await callback.message.answer(caption, parse_mode="HTML")
+    await callback.answer()
+
+# Просмотр своих записей и отмена клиентом
 @router.message(F.text == "👤 Мои записи")
 async def cmd_my_appointments(message: Message):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("""
-            SELECT a.date, a.time, s.name, a.status 
+            SELECT a.id, a.date, a.time, s.name, a.status 
             FROM appointments a
             LEFT JOIN services s ON a.service_id = s.id
             WHERE a.user_id = ? ORDER BY a.date, a.time
@@ -201,13 +259,38 @@ async def cmd_my_appointments(message: Message):
         await message.answer("У вас пока нет активных записей.")
         return
         
-    text = "👤 <b>Ваши визиты:</b>\n\n"
+    await message.answer("👤 <b>Ваши визиты:</b>", parse_mode="HTML")
     status_mapping = {"pending": "⏳ Ожидает подтверждения", "confirmed": "✅ Подтверждена", "rejected": "❌ Отклонена"}
-    for date, time, name, status in rows:
+    
+    for row_id, date, time, name, status in rows:
         service_name = name if name else "Удаленная процедура"
-        text += f"📅 <b>{date} в {time}</b>\n💆‍♀️ Процедура: {service_name}\nСтатус: {status_mapping.get(status, status)}\n\n"
+        text = f"📅 <b>{date} в {time}</b>\n💆‍♀️ Процедура: {service_name}\nСтатус: {status_mapping.get(status, status)}"
         
-    await message.answer(text, parse_mode="HTML")
+        builder = InlineKeyboardBuilder()
+        if status in ['pending', 'confirmed']:
+            builder.row(InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"cli_cancel_{row_id}"))
+            await message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+        else:
+            await message.answer(text, parse_mode="HTML")
+
+@router.callback_query(F.data.startswith("cli_cancel_"))
+async def cli_cancel_appointment(callback: CallbackQuery):
+    app_id = int(callback.data.split("_")[2])
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT date, time FROM appointments WHERE id = ?", (app_id,)) as cursor:
+            app = await cursor.fetchone()
+        if app:
+            await db.execute("UPDATE appointments SET status = 'rejected' WHERE id = ?", (app_id,))
+            await db.commit()
+            
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(chat_id=admin_id, text=f"⚠️ Клиент отменил свою запись №{app_id} на {app[0]} в {app[1]}")
+                except Exception: pass
+                
+    await callback.message.edit_text(callback.message.text + "\n\n🔴 <i>Вы успешно отменили эту запись.</i>", parse_mode="HTML")
+    await callback.answer("Запись отменена")
 
 # ==========================================
 # ПРОЦЕСС ЗАПИСИ С ИСПОЛЬЗОВАНИЕМ КАЛЕНДАРЯ
@@ -231,7 +314,7 @@ async def start_booking(message: Message, state: FSMContext):
     await message.answer("Выберите интересующую категорию услуг:", reply_markup=builder.as_markup())
 
 @router.callback_query(ClientBooking.category, F.data.startswith("book_cat_"))
-async def process_category(callback: callback_query, state: FSMContext):
+async def process_category(callback: CallbackQuery, state: FSMContext):
     cat_id = int(callback.data.split("_")[2])
     
     async with aiosqlite.connect(DB_NAME) as db:
@@ -251,28 +334,26 @@ async def process_category(callback: callback_query, state: FSMContext):
     await callback.answer()
 
 @router.callback_query(ClientBooking.service, F.data.startswith("book_serv_"))
-async def process_service(callback: callback_query, state: FSMContext):
+async def process_service(callback: CallbackQuery, state: FSMContext):
     service_id = int(callback.data.split("_")[2])
     await state.update_data(service_id=service_id)
     
     await state.set_state(ClientBooking.date)
     
-    # Инициализация и запуск готовой библиотеки календаря
-    calendar = SimpleCalendar(show_alerts=True)
-    await callback.message.edit_text(
-        "Выберите дату визита в календаре:", 
-        reply_markup=await calendar.start_calendar()
-    )
+    calendar = SimpleCalendar()
+    now = datetime.date.today()
+    markup = await calendar.start_calendar()
+    markup = await highlight_calendar(markup, now.year, now.month)
+
+    await callback.message.edit_text("Выберите дату визита в календаре (🟢 — есть записи):", reply_markup=markup)
     await callback.answer()
 
-# Хендлер обработки выбора даты из библиотеки календаря
 @router.callback_query(SimpleCalendarCallback.filter(), ClientBooking.date)
-async def process_calendar(callback: callback_query, callback_data: SimpleCalendarCallback, state: FSMContext):
-    calendar = SimpleCalendar(show_alerts=True)
+async def process_calendar(callback: CallbackQuery, callback_data: SimpleCalendarCallback, state: FSMContext):
+    calendar = SimpleCalendar()
     selected, date = await calendar.process_selection(callback, callback_data)
     
     if selected:
-        # Проверяем, чтобы дата не была в прошлом
         if date.date() < datetime.date.today():
             await callback.answer("Нельзя выбрать дату в прошлом!", show_alert=True)
             return
@@ -280,7 +361,6 @@ async def process_calendar(callback: callback_query, callback_data: SimpleCalend
         chosen_date = date.strftime("%Y-%m-%d")
         await state.update_data(date=chosen_date)
         
-        # Выбор тайм-слотов
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute("SELECT time FROM appointments WHERE date = ? AND status != 'rejected'", (chosen_date,)) as cursor:
                 rows = await cursor.fetchall()
@@ -302,9 +382,12 @@ async def process_calendar(callback: callback_query, callback_data: SimpleCalend
             
         await state.set_state(ClientBooking.time)
         await callback.message.edit_text(f"Выбранная дата: {chosen_date}\nТеперь выберите доступное время:", reply_markup=builder.as_markup())
+    else:
+        markup = await highlight_calendar(callback.message.reply_markup, callback_data.year, callback_data.month)
+        await callback.message.edit_reply_markup(reply_markup=markup)
 
 @router.callback_query(ClientBooking.time, F.data.startswith("book_time_"))
-async def process_time(callback: callback_query, state: FSMContext):
+async def process_time(callback: CallbackQuery, state: FSMContext):
     chosen_time = callback.data.split("_")[2]
     await state.update_data(time=chosen_time)
     
@@ -332,7 +415,7 @@ async def process_allergies(message: Message, state: FSMContext):
     )
 
 @router.callback_query(ClientBooking.photo, F.data == "skip_photo")
-async def skip_photo_callback(callback: callback_query, state: FSMContext):
+async def skip_photo_callback(callback: CallbackQuery, state: FSMContext):
     await state.update_data(photo_id=None)
     await finish_booking(callback.message, state, callback.from_user.id)
     await callback.answer()
@@ -391,7 +474,7 @@ async def finish_booking(message: Message, state: FSMContext, user_id: int):
             logging.error(f"Ошибка уведомления админа {admin_id}: {e}")
 
 # ==========================================
-# ПАНЕЛЬ АДМИНИСТРАТОРА (ИСПРАВЛЕННЫЕ ХЕНДЛЕРЫ)
+# ПАНЕЛЬ АДМИНИСТРАТОРА (УПРАВЛЕНИЕ ЗАЯВКАМИ)
 # ==========================================
 
 @router.message(Command("admin"))
@@ -400,7 +483,7 @@ async def cmd_admin(message: Message):
     await message.answer("🎛️ Панель управления мастера:", reply_markup=get_admin_menu())
 
 @router.callback_query(F.data.startswith("adm_approve_"))
-async def adm_approve(callback: callback_query):
+async def adm_approve(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS: return
     app_id = int(callback.data.split("_")[2])
     async with aiosqlite.connect(DB_NAME) as db:
@@ -427,7 +510,7 @@ async def adm_approve(callback: callback_query):
     await callback.answer("Запись подтверждена")
 
 @router.callback_query(F.data.startswith("adm_reject_"))
-async def adm_reject(callback: callback_query):
+async def adm_reject(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS: return
     app_id = int(callback.data.split("_")[2])
     async with aiosqlite.connect(DB_NAME) as db:
@@ -449,9 +532,8 @@ async def adm_reject(callback: callback_query):
             await callback.message.edit_text(callback.message.text + "\n\n🔴 Статус: Отклонена")
     await callback.answer("Запись отклонена")
 
-# Исправленный хендлер просмотра заявок (заменен декоратор на callback_query)
 @router.callback_query(F.data == "adm_pending")
-async def adm_view_pending(callback: callback_query):
+async def adm_view_pending(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS: return
     
     async with aiosqlite.connect(DB_NAME) as db:
@@ -482,48 +564,117 @@ async def adm_view_pending(callback: callback_query):
         await callback.message.answer(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-@router.callback_query(F.data.startswith("adm_sched_"))
-async def adm_schedule(callback: callback_query):
+# Календарь Админа
+@router.callback_query(F.data == "adm_sched_calendar")
+async def adm_sched_calendar(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
-    target = callback.data.split("_")[2]
     
-    date_target = datetime.date.today()
-    if target == "tomorrow":
-        date_target += datetime.timedelta(days=1)
-        
-    date_str = date_target.strftime("%Y-%m-%d")
-    day_name_ru = RU_DAYS[date_target.weekday()] # Получаем день недели гарантированно на русском
+    await state.set_state(AdminSchedule.select_date)
+    calendar = SimpleCalendar()
     
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
-            SELECT a.time, s.name, u.phone, u.username, a.photo_id, a.allergies_comment 
-            FROM appointments a
-            LEFT JOIN services s ON a.service_id = s.id
-            LEFT JOIN users u ON a.user_id = u.user_id
-            WHERE a.date = ? AND a.status = 'confirmed'
-            ORDER BY a.time
-        """, (date_str,)) as cursor:
-            rows = await cursor.fetchall()
-            
-    if not rows:
-        await callback.message.answer(f"На {date_str} ({day_name_ru}) подтвержденных записей нет.")
-        await callback.answer()
-        return
-        
-    await callback.message.answer(f"📅 Расписание на {date_str} ({day_name_ru}):")
-    for time, s_name, phone, username, photo_id, allergies in rows:
-        s_name = s_name if s_name else "Удаленная процедура"
-        text = f"⏰ <b>{time}</b>\n💆‍♀️ {s_name}\n📞 Тел: {phone or 'Не указан'}\n👤 Аккаунт: @{username or 'нет'}\n⚠️ Комментарий: {allergies}"
-        if photo_id:
-            await callback.message.answer_photo(photo=photo_id, caption=text, parse_mode="HTML")
-        else:
-            await callback.message.answer(text, parse_mode="HTML")
+    now = datetime.date.today()
+    markup = await calendar.start_calendar()
+    markup = await highlight_calendar(markup, now.year, now.month)
+
+    await callback.message.edit_text("Выберите дату расписания (🟢 — есть записи):", reply_markup=markup)
     await callback.answer()
 
-# Управление прайсом
+@router.callback_query(SimpleCalendarCallback.filter(), AdminSchedule.select_date)
+async def process_admin_calendar(callback: CallbackQuery, callback_data: SimpleCalendarCallback, state: FSMContext):
+    calendar = SimpleCalendar()
+    selected, date = await calendar.process_selection(callback, callback_data)
+    
+    if selected:
+        await state.clear() 
+        date_str = date.strftime("%Y-%m-%d")
+        day_name_ru = RU_DAYS[date.weekday()]
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("""
+                SELECT a.id, a.time, s.name, u.phone, u.username, a.photo_id, a.allergies_comment, a.admin_comment 
+                FROM appointments a
+                LEFT JOIN services s ON a.service_id = s.id
+                LEFT JOIN users u ON a.user_id = u.user_id
+                WHERE a.date = ? AND a.status = 'confirmed'
+                ORDER BY a.time
+            """, (date_str,)) as cursor:
+                rows = await cursor.fetchall()
+                
+        if not rows:
+            await callback.message.answer(f"На {date_str} ({day_name_ru}) подтвержденных записей нет.")
+            await callback.answer()
+            return
+            
+        await callback.message.answer(f"📅 Расписание на {date_str} ({day_name_ru}):")
+        for row in rows:
+            app_id, time, s_name, phone, username, photo_id, allergies, admin_comment = row
+            s_name = s_name if s_name else "Удаленная процедура"
+            
+            text = f"⏰ <b>{time}</b>\n💆‍♀️ {s_name}\n📞 Тел: {phone or 'Не указан'}\n👤 Аккаунт: @{username or 'нет'}\n⚠️ Клиент: {allergies}"
+            if admin_comment:
+                text += f"\n📝 <b>Заметка мастера:</b> {admin_comment}"
+                
+            builder = InlineKeyboardBuilder()
+            builder.row(
+                InlineKeyboardButton(text="📝 Заметка", callback_data=f"adm_note_{app_id}"),
+                InlineKeyboardButton(text="❌ Отменить", callback_data=f"adm_cancel_{app_id}")
+            )
 
+            if photo_id:
+                await callback.message.answer_photo(photo=photo_id, caption=text, reply_markup=builder.as_markup(), parse_mode="HTML")
+            else:
+                await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+        await callback.answer()
+    else:
+        markup = await highlight_calendar(callback.message.reply_markup, callback_data.year, callback_data.month)
+        await callback.message.edit_reply_markup(reply_markup=markup)
+
+# Отмена и комментарии мастера (хендлеры)
+@router.callback_query(F.data.startswith("adm_cancel_"))
+async def adm_cancel_appointment(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS: return
+    app_id = int(callback.data.split("_")[2])
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id, date, time FROM appointments WHERE id = ?", (app_id,)) as cursor:
+            app = await cursor.fetchone()
+        if app:
+            await db.execute("UPDATE appointments SET status = 'rejected' WHERE id = ?", (app_id,))
+            await db.commit()
+            try:
+                await bot.send_message(chat_id=app[0], text=f"🔴 Извините, ваша запись на {app[1]} в {app[2]} была отменена мастером.")
+            except Exception: pass
+            
+    # Удаляем клавиатуру и пишем что отменено
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.reply("🔴 Запись успешно отменена мастером.")
+    await callback.answer("Запись отменена")
+
+@router.callback_query(F.data.startswith("adm_note_"))
+async def adm_start_note(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS: return
+    app_id = int(callback.data.split("_")[2])
+    
+    await state.update_data(note_app_id=app_id)
+    await state.set_state(AdminSchedule.add_comment)
+    await callback.message.answer("Введите текст внутренней заметки для этой записи:")
+    await callback.answer()
+
+@router.message(AdminSchedule.add_comment, F.text)
+async def adm_save_note(message: Message, state: FSMContext):
+    data = await state.get_data()
+    app_id = data['note_app_id']
+    await state.clear()
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE appointments SET admin_comment = ? WHERE id = ?", (message.text, app_id))
+        await db.commit()
+        
+    await message.answer("✅ Заметка к записи успешно сохранена!")
+
+# Управление прайсом
 @router.callback_query(F.data == "adm_add_cat")
-async def adm_add_cat_start(callback: callback_query, state: FSMContext):
+async def adm_add_cat_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
     await state.set_state(AdminPrice.add_category)
     await callback.message.answer("Введите название новой категории:")
@@ -538,7 +689,7 @@ async def adm_add_cat_finish(message: Message, state: FSMContext):
     await message.answer(f"Категория '{message.text}' успешно создана!", reply_markup=get_admin_menu())
 
 @router.callback_query(F.data == "adm_add_serv")
-async def adm_add_serv_start(callback: callback_query, state: FSMContext):
+async def adm_add_serv_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT id, name FROM categories") as cursor:
@@ -558,7 +709,7 @@ async def adm_add_serv_start(callback: callback_query, state: FSMContext):
     await callback.answer()
 
 @router.callback_query(AdminPrice.service_category, F.data.startswith("adm_sel_cat_"))
-async def adm_add_serv_cat_chosen(callback: callback_query, state: FSMContext):
+async def adm_add_serv_cat_chosen(callback: CallbackQuery, state: FSMContext):
     cat_id = int(callback.data.split("_")[3])
     await state.update_data(cat_id=cat_id)
     await state.set_state(AdminPrice.service_name)
@@ -577,18 +728,35 @@ async def adm_add_serv_price_chosen(message: Message, state: FSMContext):
         await message.answer("Пожалуйста, введите корректное число.")
         return
         
+    await state.update_data(price=int(message.text))
+    await state.set_state(AdminPrice.service_photo)
+    
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="Пропустить ➡️", callback_data="skip_serv_photo"))
+    await message.answer("Отправьте ФОТОГРАФИЮ для услуги или нажмите 'Пропустить':", reply_markup=builder.as_markup())
+
+@router.callback_query(AdminPrice.service_photo, F.data == "skip_serv_photo")
+async def skip_serv_photo(callback: CallbackQuery, state: FSMContext):
+    await save_service_to_db(callback.message, state, None)
+    await callback.answer()
+
+@router.message(AdminPrice.service_photo, F.photo)
+async def process_serv_photo(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    await save_service_to_db(message, state, photo_id)
+
+async def save_service_to_db(message: Message, state: FSMContext, photo_id: str | None):
     data = await state.get_data()
     await state.clear()
     
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT INTO services (category_id, name, price) VALUES (?, ?, ?)", 
-                         (data['cat_id'], data['name'], int(message.text)))
+        await db.execute("INSERT INTO services (category_id, name, price, photo_id) VALUES (?, ?, ?, ?)", 
+                         (data['cat_id'], data['name'], data['price'], photo_id))
         await db.commit()
-        
-    await message.answer(f"Услуга '{data['name']}' добавлена!", reply_markup=get_admin_menu())
+    await message.answer(f"Услуга '{data['name']}' успешно добавлена!", reply_markup=get_admin_menu())
 
 @router.callback_query(F.data == "adm_del_serv_list")
-async def adm_del_serv_list(callback: callback_query):
+async def adm_del_serv_list(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS: return
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT id, name FROM services") as cursor:
@@ -607,7 +775,7 @@ async def adm_del_serv_list(callback: callback_query):
     await callback.answer()
 
 @router.callback_query(F.data.startswith("adm_del_srv_"))
-async def adm_del_serv_finish(callback: callback_query):
+async def adm_del_serv_finish(callback: CallbackQuery):
     s_id = int(callback.data.split("_")[3])
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM services WHERE id = ?", (s_id,))
@@ -616,9 +784,8 @@ async def adm_del_serv_finish(callback: callback_query):
     await callback.answer()
 
 # Рассылка
-
 @router.callback_query(F.data == "adm_broadcast")
-async def adm_broadcast_start(callback: callback_query, state: FSMContext):
+async def adm_broadcast_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
     await state.set_state(AdminBroadcast.message)
     await callback.message.answer("Введите текст сообщения для рассылки:")
@@ -683,7 +850,7 @@ async def reminder_scheduler():
         except Exception as e:
             logging.error(f"Ошибка в планировщике: {e}")
             
-        await asyncio.sleep(60) # Проверяем раз в минуту для точности
+        await asyncio.sleep(60) 
 
 # ==========================================
 # ЗАПУСК БОТА
@@ -693,7 +860,7 @@ async def main():
     await init_db()
     dp.include_router(router)
     asyncio.create_task(reminder_scheduler())
-    logging.info("Исправленная версия бота успешно запущена.")
+    logging.info("Финальная версия бота (со всеми функциями) успешно запущена.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
