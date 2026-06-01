@@ -1,0 +1,5 @@
+aiogram
+gspread
+apscheduler
+google-auth
+python-dotenv
