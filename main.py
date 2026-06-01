@@ -820,6 +820,7 @@ async def reminder_scheduler():
         try:
             now = datetime.datetime.now()
             async with aiosqlite.connect(DB_NAME) as db:
+                # 1. Напоминания для клиентов
                 async with db.execute("""
                     SELECT a.id, a.user_id, a.date, a.time, s.name 
                     FROM appointments a
@@ -827,13 +828,14 @@ async def reminder_scheduler():
                     WHERE a.status = 'confirmed' AND a.reminded = 0
                 """) as cursor:
                     appointments = await cursor.fetchall()
-                    
+
                 for app_id, user_id, date_str, time_str, service_name in appointments:
+                    app_datetime = None 
                     try:
                         app_datetime = datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
                         time_delta = app_datetime - now
                         
-                        if 0 < time_delta.total_seconds() <= 86400:
+                        if app_datetime and 0 < time_delta.total_seconds() <= 86400:
                             s_name = service_name if service_name else "процедуру"
                             await bot.send_message(
                                 chat_id=user_id,
@@ -846,11 +848,38 @@ async def reminder_scheduler():
                             await db.commit()
                     except Exception as e:
                         logging.error(f"Ошибка обработки напоминания для записи #{app_id}: {e}")
+
+                # 2. Отчет для мастера (отправка каждый день в 20:00)
+                if now.hour == 19 and now.minute == 38:
+                    tomorrow = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                    async with db.execute("""
+                        SELECT a.time, s.name, u.username 
+                        FROM appointments a
+                        LEFT JOIN services s ON a.service_id = s.id
+                        LEFT JOIN users u ON a.user_id = u.user_id
+                        WHERE a.date = ? AND a.status = 'confirmed'
+                        ORDER BY a.time
+                    """, (tomorrow,)) as cursor:
+                        admin_data = await cursor.fetchall()
+                    
+                    if admin_data:
+                        report = f"📅 <b>Расписание на завтра ({tomorrow}):</b>\n\n"
+                        for time, s_name, user in admin_data:
+                            report += f"⏰ {time} — {s_name} (@{user or 'нет никнейма'})\n"
                         
+                        for admin_id in ADMIN_IDS:
+                            try:
+                                await bot.send_message(admin_id, report, parse_mode="HTML")
+                            except Exception as e:
+                                logging.error(f"Не удалось отправить отчет админу {admin_id}: {e}")
+                        
+                        # Небольшая пауза, чтобы не отправить отчет несколько раз за одну минуту
+                        await asyncio.sleep(60)
+            
         except Exception as e:
             logging.error(f"Ошибка в планировщике: {e}")
             
-        await asyncio.sleep(60) 
+        await asyncio.sleep(60)
 
 # ==========================================
 # ЗАПУСК БОТА
