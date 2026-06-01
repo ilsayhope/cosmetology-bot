@@ -850,7 +850,7 @@ async def reminder_scheduler():
                         logging.error(f"Ошибка обработки напоминания для записи #{app_id}: {e}")
 
                 # 2. Отчет для мастера (отправка каждый день в 20:00)
-                if now.hour == 19 and now.minute == 38:
+                if now.hour == 20 and now.minute == 00:
                     tomorrow = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
                     async with db.execute("""
                         SELECT a.time, s.name, u.username 
